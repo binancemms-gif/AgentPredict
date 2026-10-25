@@ -45,7 +45,7 @@ export const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({
   const [isDetailOpen, setIsDetailOpen] = useState<boolean>(true);
   const [viewFilter, setViewFilter] = useState<'both' | 'user' | 'agent'>('both');
 
-  // Generate 7-day data with realistic seed history if user has fresh/empty history
+  // Generate the seven-day view from recorded backend settlements.
   const daysData: DayStats[] = useMemo(() => {
     const now = new Date();
     const days: DayStats[] = [];
@@ -62,8 +62,7 @@ export const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({
       roundsByDate[key].push(h);
     });
 
-    const basePrice = currentPrice || (marketId.startsWith('BTC') ? 68200 : 175);
-    const stepDelta = marketId.startsWith('BTC') ? 45 : 0.4;
+    // Generate last 7 days from persisted backend settlements only.
 
     // Generate last 7 days (day 6 down to day 0 = today)
     for (let i = 6; i >= 0; i--) {
@@ -78,39 +77,6 @@ export const CalendarHeatmap: React.FC<CalendarHeatmapProps> = ({
       const isToday = i === 0;
 
       let dayRounds = roundsByDate[dateKey] || [];
-
-      // If this day has no or very few recorded rounds, synthesize realistic baseline rounds
-      // so the 7-day heatmap displays rich performance history across the entire week
-      if (dayRounds.length < 6) {
-        const synthCount = isToday ? Math.max(3, dayRounds.length) : 8 + ((i * 3) % 7);
-        const needed = synthCount - dayRounds.length;
-        const synthRounds: RoundHistoryItem[] = [];
-
-        for (let j = 1; j <= needed; j++) {
-          const hourOffset = (j * 2) % 20 + 2;
-          const roundTs = new Date(targetDate).setHours(hourOffset, (j * 15) % 60, 0, 0);
-          const isUp = (i * 5 + j * 7 + 3) % 10 > 4;
-          const userWon = (i * 7 + j * 11 + 2) % 10 < 6; // ~60% user win rate
-          const agentWon = (i * 3 + j * 5 + 4) % 10 < 6; // ~60% agent win rate
-
-          const res: 'up' | 'down' = isUp ? 'up' : 'down';
-          const uPick: 'up' | 'down' = userWon ? res : res === 'up' ? 'down' : 'up';
-          const agPick: 'up' | 'down' = agentWon ? res : res === 'up' ? 'down' : 'up';
-
-          synthRounds.push({
-            s: roundTs,
-            tg: basePrice + ((j % 8) - 4) * stepDelta,
-            f: basePrice + ((j % 8) - 4) * stepDelta + (res === 'up' ? stepDelta * 0.7 : -stepDelta * 0.7),
-            res,
-            ag: agPick,
-            ap: 0.55,
-            u: uPick,
-            stake: 10,
-            payout: userWon ? 19 : 0,
-          });
-        }
-        dayRounds = [...dayRounds, ...synthRounds];
-      }
 
       // Sort rounds by timestamp descending
       dayRounds.sort((a, b) => b.s - a.s);

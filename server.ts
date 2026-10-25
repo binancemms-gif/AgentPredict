@@ -3,6 +3,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { Pool } from 'pg';
+import { Redis } from '@upstash/redis';
 
 dotenv.config();
 
@@ -73,47 +75,54 @@ const MARKETS_CONFIG: Record<string, { product: string; roundMs: number; lockBef
 
 const marketEngines: Record<string, MarketState> = {};
 
-// Initialize state for each market with realistic historical seed data
+const neonPool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 10_000 }) : null;
+const redis = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
+  ? new Redis({ url: process.env.KV_REST_API_URL, token: process.env.KV_REST_API_TOKEN })
+  : null;
+
+async function persistCandles(product: string, timeframe: string, candles: number[][]) {
+  if (!neonPool) return;
+  const client = await neonPool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [timestamp, low, high, open, close, volume] of candles) {
+      await client.query(
+        `INSERT INTO market_candles (product, timeframe, candle_ts, open_price, high_price, low_price, close_price, volume, source)
+         VALUES ($1, $2, to_timestamp($3), $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (product, timeframe, candle_ts) DO UPDATE SET open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price, low_price = EXCLUDED.low_price, close_price = EXCLUDED.close_price, volume = EXCLUDED.volume`,
+        [product, timeframe, open, open, high, low, close, volume, 'coinbase-exchange'],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
+async function cacheFeed(key: string, value: unknown, ttlSeconds = 120) {
+  if (redis) await redis.set(key, value, { ex: ttlSeconds });
+}
+
+async function readCachedFeed<T>(key: string): Promise<T | null> {
+  if (!redis) return null;
+  return (await redis.get<T>(key)) ?? null;
+}
+
+// Start empty. Predictions and settled outcomes must come from the live feed and Neon.
 Object.entries(MARKETS_CONFIG).forEach(([mid, cfg]) => {
-  const seedPreds: NMPrediction[] = [];
-  const baseTs = Math.floor(Date.now() / cfg.roundMs) * cfg.roundMs;
-  let settledCount = 38;
-  let wonCount = 23;
-
-  for (let i = settledCount; i >= 1; i--) {
-    const ts = baseTs - i * cfg.roundMs;
-    const isUp = (i * 7 + 3) % 10 > 4;
-    const lean = 0.51 + ((i % 5) - 2) * 0.04;
-    seedPreds.push({
-      made_ts: ts,
-      target_ts: ts + cfg.roundMs,
-      ref_price: mid.startsWith('SOL') ? 172.5 + (i * 0.2) : 67400 + (i * 35),
-      p_up: lean,
-      lean_p: lean,
-      decision: lean >= 0.52 ? 'UP' : lean <= 0.48 ? 'DOWN' : 'NO_TRADE',
-      version: 'nm5-walkforward-v3.1',
-      validated: 1,
-      close_price: mid.startsWith('SOL') ? 172.5 + (i * 0.2) + (isUp ? 0.35 : -0.28) : 67400 + (i * 35) + (isUp ? 80 : -95),
-      outcome: isUp ? 'UP' : 'DOWN',
-      settled: 1,
-    });
-  }
-
   marketEngines[mid] = {
     product: cfg.product,
     roundMs: cfg.roundMs,
     lockBeforeMs: cfg.lockBeforeMs,
     rounds: [],
-    predictions: seedPreds,
-    validatedModel: 'nm5-walkforward-v3.1',
-    leanModel: 'nm5-walkforward-v3.1',
-    weights: [0.012, 0.45, -0.22, 0.31, 0.15, -0.08, 0.28, -0.14],
-    lessons: [
-      `low_vol: 24/40 rounds ended UP (60.0%)`,
-      `order_flow: high taker imbalance correlated with 63.2% directional edge`,
-    ],
+    predictions: [],
+    validatedModel: null,
+    leanModel: 'live-feed-baseline',
+    weights: [],
+    lessons: [],
     paused: false,
-    balance: 1045.5,
+    balance: 0,
   };
 });
 
@@ -142,66 +151,104 @@ function calculateStats(predictions: NMPrediction[]) {
   };
 }
 
-// Background tick to update prediction oracle state
-setInterval(async () => {
-  const now = Date.now();
-  Object.entries(marketEngines).forEach(([mid, engine]) => {
-    if (engine.paused) return;
-    const currentRoundStart = Math.floor(now / engine.roundMs) * engine.roundMs;
-    const existing = engine.predictions.find((p) => p.made_ts === currentRoundStart);
-    if (!existing) {
-      // Calculate dynamic pseudo-signal based on recent minute
-      const seedVal = Math.sin(now / 100000);
-      const lean = Math.max(0.35, Math.min(0.65, 0.5 + seedVal * 0.12));
-      const pUp = engine.validatedModel ? lean : 0.5;
-      const dec: 'UP' | 'DOWN' | 'NO_TRADE' = pUp >= 0.52 ? 'UP' : pUp <= 0.48 ? 'DOWN' : 'NO_TRADE';
+// Background tick to update prediction oracle state.
+// The refresh is aligned to the requested five-minute paper cadence rather than
+// polling every few seconds and repeatedly evaluating the same market window.
+const ORACLE_REFRESH_MS = 5 * 60 * 1000;
+let oracleRefreshRunning = false;
 
-      engine.predictions.unshift({
-        made_ts: currentRoundStart,
-        target_ts: currentRoundStart + engine.roundMs,
-        ref_price: mid.startsWith('SOL') ? 175.0 : 68500.0,
-        p_up: pUp,
-        lean_p: lean,
-        decision: dec,
-        version: engine.validatedModel || engine.leanModel,
-        validated: engine.validatedModel ? 1 : 0,
-        close_price: null,
-        outcome: null,
-        settled: 0,
+async function refreshOraclePredictions() {
+  if (oracleRefreshRunning) return;
+  oracleRefreshRunning = true;
+  try {
+    const now = Date.now();
+    await Promise.all(Object.entries(marketEngines).map(async ([mid, engine]) => {
+      if (engine.paused) return;
+      const tickerResponse = await fetch(`https://api.exchange.coinbase.com/products/${engine.product}/ticker`);
+      if (!tickerResponse.ok) throw new Error(`Live ticker unavailable for ${engine.product}`);
+      const ticker = await tickerResponse.json() as { price?: string };
+      const livePrice = Number(ticker.price);
+      if (!Number.isFinite(livePrice) || livePrice <= 0) throw new Error(`Invalid live price for ${engine.product}`);
+
+      const currentRoundStart = Math.floor(now / engine.roundMs) * engine.roundMs;
+      const existing = engine.predictions.find((p) => p.made_ts === currentRoundStart);
+      if (!existing) {
+        const lean = 0.5;
+        engine.predictions.unshift({
+          made_ts: currentRoundStart,
+          target_ts: currentRoundStart + engine.roundMs,
+          ref_price: livePrice,
+          p_up: lean,
+          lean_p: lean,
+          decision: 'NO_TRADE',
+          version: engine.leanModel,
+          validated: 0,
+          close_price: null,
+          outcome: null,
+          settled: 0,
+        });
+        if (engine.predictions.length > 100) engine.predictions.pop();
+      }
+
+      engine.predictions.forEach((p) => {
+        if (p.settled === 0 && now >= p.target_ts) {
+          p.settled = 1;
+          p.close_price = livePrice;
+          p.outcome = livePrice === p.ref_price ? 'TIE' : livePrice > p.ref_price ? 'UP' : 'DOWN';
+        }
       });
 
-      if (engine.predictions.length > 100) {
-        engine.predictions.pop();
-      }
-    }
+      await cacheFeed(`lexi:prediction:${mid}`, {
+        market: mid,
+        latest: engine.predictions[0] || null,
+        live_stats: calculateStats(engine.predictions),
+        validated_model: engine.validatedModel,
+        lean_model: engine.leanModel,
+        refreshed_at: now,
+      }, 600);
+    }));
+  } finally {
+    oracleRefreshRunning = false;
+  }
+}
 
-    // Check if previous rounds are due for settlement
-    engine.predictions.forEach((p) => {
-      if (p.settled === 0 && now >= p.target_ts) {
-        p.settled = 1;
-        p.close_price = p.ref_price * (1 + (Math.random() - 0.48) * 0.004);
-        p.outcome = p.close_price >= p.ref_price ? 'UP' : 'DOWN';
-      }
-    });
-  });
-}, 10_000);
+// Run once at startup, then refresh every five minutes.
+void refreshOraclePredictions();
+setInterval(() => void refreshOraclePredictions(), ORACLE_REFRESH_MS);
 
 // API: /predict or /api/predict endpoint requested by client code
-const handlePredict = (req: Request, res: Response) => {
+const handlePredict = async (req: Request, res: Response) => {
   const market = (req.query.market as string) || 'SOL-5m';
   const engine = marketEngines[market];
   if (!engine) {
     res.status(404).json({ error: 'Market not found' });
     return;
   }
-  const latest = engine.predictions[0] || null;
-  const stats = calculateStats(engine.predictions);
+
+  const cached = await readCachedFeed<{
+    market: string;
+    latest: NMPrediction | null;
+    live_stats: ReturnType<typeof calculateStats>;
+    validated_model: string | null;
+    lean_model: string;
+    refreshed_at: number;
+  }>(`lexi:prediction:${market}`);
+
+  if (cached) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ...cached, source: 'upstash-redis' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
   res.json({
     market,
-    latest,
-    live_stats: stats,
+    latest: engine.predictions[0] || null,
+    live_stats: calculateStats(engine.predictions),
     validated_model: engine.validatedModel,
     lean_model: engine.leanModel,
+    refreshed_at: null,
+    source: 'live-engine',
   });
 };
 
@@ -233,6 +280,42 @@ app.get('/api/gru/forecast', (req: Request, res: Response) => {
       outperformed_baseline_sigma: 3.65,
     },
   });
+});
+
+// Timestamped Coinbase holdout test. The final 20% is never used to form features.
+app.get('/api/paper/backtest', async (req: Request, res: Response) => {
+  const market = (req.query.market as string) || 'BTC-5m';
+  const cfg = MARKETS_CONFIG[market];
+  if (!cfg) { res.status(404).json({ error: 'Market not found' }); return; }
+  try {
+    const response = await fetch(`https://api.exchange.coinbase.com/products/${cfg.product}/candles?granularity=${Math.round(cfg.roundMs / 1000)}`);
+    if (!response.ok) throw new Error(`Coinbase ${response.status}`);
+    const raw = await response.json() as number[][];
+    const candles = raw.sort((a, b) => a[0] - b[0]).filter((row) => Number.isFinite(row[4]) && row[4] > 0);
+    const timeframe = market.endsWith('1h') ? '1h' : '5m';
+    await persistCandles(cfg.product, timeframe, candles);
+    const split = Math.max(30, Math.floor(candles.length * 0.8));
+    const holdout = candles.slice(split);
+    let correct = 0; let brier = 0; let baselineBrier = 0; let trades = 0; let upPredictions = 0;
+    holdout.forEach((row, index) => {
+      const sourceIndex = split + index;
+      if (sourceIndex < 6 || sourceIndex >= candles.length - 1) return;
+      const closes = candles.slice(sourceIndex - 6, sourceIndex).map((item) => item[4]);
+      const momentum = Math.log(closes[closes.length - 1] / closes[0]);
+      const dispersion = Math.max(0.00001, Math.sqrt(closes.slice(1).map((p, i) => Math.pow(Math.log(p / closes[i]), 2)).reduce((a, b) => a + b, 0) / 5));
+      const pUp = Math.max(0.08, Math.min(0.92, 0.5 + 0.18 * Math.tanh(momentum / dispersion)));
+      const outcome = candles[sourceIndex + 1][4] >= row[4] ? 1 : 0;
+      if (pUp >= 0.52 || pUp <= 0.48) { trades++; if ((pUp >= 0.5 ? 1 : 0) === outcome) correct++; }
+      if (pUp >= 0.5) upPredictions++;
+      brier += Math.pow(pUp - outcome, 2); baselineBrier += 0.25;
+    });
+    const evaluated = Math.max(1, holdout.length - 1);
+    const accuracyPct = Math.round((correct / Math.max(1, trades)) * 1000) / 10;
+    const brierScore = Math.round((brier / evaluated) * 1000) / 1000;
+    const result = { market, product: cfg.product, feed: 'Coinbase Exchange candles', generatedAt: Date.now(), candles: candles.length, holdoutCandles: evaluated, horizon: market.endsWith('1h') ? 'next 1h candle' : 'next 5m candle', metrics: { accuracyPct, brierScore, baselineBrier: 0.25, trades, upPredictions }, verdict: accuracyPct >= 52 && brierScore < 0.25 ? 'PASS' : 'HOLD' };
+    await cacheFeed(`lexi:paper:${market}`, result);
+    res.json({ ...result, persistence: { neon: Boolean(neonPool), redis: Boolean(redis), memory: 'disabled for feed snapshots' } });
+  } catch (error) { res.status(503).json({ error: 'Historical market feed unavailable', detail: error instanceof Error ? error.message : 'unknown' }); }
 });
 
 // API: Health / System State
