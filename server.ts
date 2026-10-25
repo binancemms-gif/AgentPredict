@@ -173,49 +173,62 @@ function calculateStats(predictions: NMPrediction[]) {
   };
 }
 
-// Background tick to update prediction oracle state
-setInterval(async () => {
-  const now = Date.now();
-  Object.entries(marketEngines).forEach(([mid, engine]) => {
-    if (engine.paused) return;
-    const currentRoundStart = Math.floor(now / engine.roundMs) * engine.roundMs;
-    const existing = engine.predictions.find((p) => p.made_ts === currentRoundStart);
-    if (!existing) {
-      // Calculate dynamic pseudo-signal based on recent minute
-      const seedVal = Math.sin(now / 100000);
-      const lean = Math.max(0.35, Math.min(0.65, 0.5 + seedVal * 0.12));
-      const pUp = engine.validatedModel ? lean : 0.5;
-      const dec: 'UP' | 'DOWN' | 'NO_TRADE' = pUp >= 0.52 ? 'UP' : pUp <= 0.48 ? 'DOWN' : 'NO_TRADE';
+// Background tick to update prediction oracle state.
+// The refresh is aligned to the requested five-minute paper cadence rather than
+// polling every few seconds and repeatedly evaluating the same market window.
+const ORACLE_REFRESH_MS = 5 * 60 * 1000;
+let oracleRefreshRunning = false;
 
-      engine.predictions.unshift({
-        made_ts: currentRoundStart,
-        target_ts: currentRoundStart + engine.roundMs,
-        ref_price: mid.startsWith('SOL') ? 175.0 : 68500.0,
-        p_up: pUp,
-        lean_p: lean,
-        decision: dec,
-        version: engine.validatedModel || engine.leanModel,
-        validated: engine.validatedModel ? 1 : 0,
-        close_price: null,
-        outcome: null,
-        settled: 0,
+async function refreshOraclePredictions() {
+  if (oracleRefreshRunning) return;
+  oracleRefreshRunning = true;
+  try {
+    const now = Date.now();
+    Object.entries(marketEngines).forEach(([mid, engine]) => {
+      if (engine.paused) return;
+      const currentRoundStart = Math.floor(now / engine.roundMs) * engine.roundMs;
+      const existing = engine.predictions.find((p) => p.made_ts === currentRoundStart);
+
+      if (!existing) {
+        // Calculate dynamic pseudo-signal based on recent minute.
+        const seedVal = Math.sin(now / 100000);
+        const lean = Math.max(0.35, Math.min(0.65, 0.5 + seedVal * 0.12));
+        const pUp = engine.validatedModel ? lean : 0.5;
+        const dec: 'UP' | 'DOWN' | 'NO_TRADE' = pUp >= 0.52 ? 'UP' : pUp <= 0.48 ? 'DOWN' : 'NO_TRADE';
+
+        engine.predictions.unshift({
+          made_ts: currentRoundStart,
+          target_ts: currentRoundStart + engine.roundMs,
+          ref_price: mid.startsWith('SOL') ? 175.0 : 68500.0,
+          p_up: pUp,
+          lean_p: lean,
+          decision: dec,
+          version: engine.validatedModel || engine.leanModel,
+          validated: engine.validatedModel ? 1 : 0,
+          close_price: null,
+          outcome: null,
+          settled: 0,
+        });
+
+        if (engine.predictions.length > 100) engine.predictions.pop();
+      }
+
+      engine.predictions.forEach((p) => {
+        if (p.settled === 0 && now >= p.target_ts) {
+          p.settled = 1;
+          p.close_price = p.ref_price * (1 + (Math.random() - 0.48) * 0.004);
+          p.outcome = p.close_price >= p.ref_price ? 'UP' : 'DOWN';
+        }
       });
-
-      if (engine.predictions.length > 100) {
-        engine.predictions.pop();
-      }
-    }
-
-    // Check if previous rounds are due for settlement
-    engine.predictions.forEach((p) => {
-      if (p.settled === 0 && now >= p.target_ts) {
-        p.settled = 1;
-        p.close_price = p.ref_price * (1 + (Math.random() - 0.48) * 0.004);
-        p.outcome = p.close_price >= p.ref_price ? 'UP' : 'DOWN';
-      }
     });
-  });
-}, 10_000);
+  } finally {
+    oracleRefreshRunning = false;
+  }
+}
+
+// Run once at startup, then refresh every five minutes.
+void refreshOraclePredictions();
+setInterval(() => void refreshOraclePredictions(), ORACLE_REFRESH_MS);
 
 // API: /predict or /api/predict endpoint requested by client code
 const handlePredict = (req: Request, res: Response) => {
