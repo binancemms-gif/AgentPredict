@@ -37,6 +37,7 @@ import { ReasoningAgentPanel } from './components/ReasoningAgentPanel';
 import { GoogleSheetsModal } from './components/GoogleSheetsModal';
 import { CalendarHeatmap } from './components/CalendarHeatmap';
 import { PiSimoGruPanel } from './components/PiSimoGruPanel';
+import { PaperModePanel } from './components/PaperModePanel';
 
 const MARKETS: Record<MarketId, MarketConfig> = {
   'BTC-5m': {
@@ -127,6 +128,7 @@ export default function App() {
   // Connection & Feeds
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [statusText, setStatusText] = useState<string>('connecting…');
+  const [lastFeedAt, setLastFeedAt] = useState<number | null>(null);
 
   // Analysis & Signals
   const [analysis, setAnalysis] = useState<AnalysisSignals | null>(null);
@@ -279,6 +281,7 @@ export default function App() {
     if (!p || p <= 0) return;
     const now = Date.now();
     lastTickTimeRef.current = now;
+    setLastFeedAt(t || now);
 
     // Update live prices for both coins
     if (product === 'BTC-USD' || (!product && activeMarket.product === 'BTC-USD')) {
@@ -800,7 +803,7 @@ export default function App() {
                   wsConnected ? 'bg-[#5ee26a] shadow-[0_0_8px_#5ee26a]' : 'bg-[#555]'
                 }`}
               />
-              <span className="truncate max-w-[140px]">{statusText}</span>
+              <span className="truncate max-w-[180px]">{statusText}{lastFeedAt ? ` · ${new Date(lastFeedAt).toLocaleTimeString()}` : ''}</span>
             </div>
           </div>
         </div>
@@ -1150,6 +1153,8 @@ export default function App() {
           onToggleTrajectoryOnChart={() => setShowGruTrajectory((v) => !v)}
           coinName={activeMarket.coinName}
         />
+
+        <PaperModePanel market={selectedMarketId} />
 
         {/* Cognitive Reasoning Agent Component */}
         <ReasoningAgentPanel

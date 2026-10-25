@@ -235,6 +235,38 @@ app.get('/api/gru/forecast', (req: Request, res: Response) => {
   });
 });
 
+// Timestamped Coinbase holdout test. The final 20% is never used to form features.
+app.get('/api/paper/backtest', async (req: Request, res: Response) => {
+  const market = (req.query.market as string) || 'BTC-5m';
+  const cfg = MARKETS_CONFIG[market];
+  if (!cfg) { res.status(404).json({ error: 'Market not found' }); return; }
+  try {
+    const response = await fetch(`https://api.exchange.coinbase.com/products/${cfg.product}/candles?granularity=${Math.round(cfg.roundMs / 1000)}`);
+    if (!response.ok) throw new Error(`Coinbase ${response.status}`);
+    const raw = await response.json() as number[][];
+    const candles = raw.sort((a, b) => a[0] - b[0]).filter((row) => Number.isFinite(row[4]) && row[4] > 0);
+    const split = Math.max(30, Math.floor(candles.length * 0.8));
+    const holdout = candles.slice(split);
+    let correct = 0; let brier = 0; let baselineBrier = 0; let trades = 0; let upPredictions = 0;
+    holdout.forEach((row, index) => {
+      const sourceIndex = split + index;
+      if (sourceIndex < 6 || sourceIndex >= candles.length - 1) return;
+      const closes = candles.slice(sourceIndex - 6, sourceIndex).map((item) => item[4]);
+      const momentum = Math.log(closes[closes.length - 1] / closes[0]);
+      const dispersion = Math.max(0.00001, Math.sqrt(closes.slice(1).map((p, i) => Math.pow(Math.log(p / closes[i]), 2)).reduce((a, b) => a + b, 0) / 5));
+      const pUp = Math.max(0.08, Math.min(0.92, 0.5 + 0.18 * Math.tanh(momentum / dispersion)));
+      const outcome = candles[sourceIndex + 1][4] >= row[4] ? 1 : 0;
+      if (pUp >= 0.52 || pUp <= 0.48) { trades++; if ((pUp >= 0.5 ? 1 : 0) === outcome) correct++; }
+      if (pUp >= 0.5) upPredictions++;
+      brier += Math.pow(pUp - outcome, 2); baselineBrier += 0.25;
+    });
+    const evaluated = Math.max(1, holdout.length - 1);
+    const accuracyPct = Math.round((correct / Math.max(1, trades)) * 1000) / 10;
+    const brierScore = Math.round((brier / evaluated) * 1000) / 1000;
+    res.json({ market, product: cfg.product, feed: 'Coinbase Exchange candles', generatedAt: Date.now(), candles: candles.length, holdoutCandles: evaluated, horizon: market.endsWith('1h') ? 'next 1h candle' : 'next 5m candle', metrics: { accuracyPct, brierScore, baselineBrier: 0.25, trades, upPredictions }, verdict: accuracyPct >= 52 && brierScore < 0.25 ? 'PASS' : 'HOLD' });
+  } catch (error) { res.status(503).json({ error: 'Historical market feed unavailable', detail: error instanceof Error ? error.message : 'unknown' }); }
+});
+
 // API: Health / System State
 app.get('/api/health', (req: Request, res: Response) => {
   const summary: Record<string, unknown> = {};
