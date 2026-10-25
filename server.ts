@@ -3,6 +3,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { Pool } from 'pg';
+import { Redis } from '@upstash/redis';
 
 dotenv.config();
 
@@ -72,6 +74,35 @@ const MARKETS_CONFIG: Record<string, { product: string; roundMs: number; lockBef
 };
 
 const marketEngines: Record<string, MarketState> = {};
+
+const neonPool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 10_000 }) : null;
+const redis = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
+  ? new Redis({ url: process.env.KV_REST_API_URL, token: process.env.KV_REST_API_TOKEN })
+  : null;
+
+async function persistCandles(product: string, timeframe: string, candles: number[][]) {
+  if (!neonPool) return;
+  const client = await neonPool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [timestamp, low, high, open, close, volume] of candles) {
+      await client.query(
+        `INSERT INTO market_candles (product, timeframe, candle_ts, open_price, high_price, low_price, close_price, volume, source)
+         VALUES ($1, $2, to_timestamp($3), $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (product, timeframe, candle_ts) DO UPDATE SET open_price = EXCLUDED.open_price, high_price = EXCLUDED.high_price, low_price = EXCLUDED.low_price, close_price = EXCLUDED.close_price, volume = EXCLUDED.volume`,
+        [product, timeframe, open, open, high, low, close, volume, 'coinbase-exchange'],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
+async function cacheFeed(key: string, value: unknown) {
+  if (redis) await redis.set(key, value, { ex: 120 });
+}
 
 // Initialize state for each market with realistic historical seed data
 Object.entries(MARKETS_CONFIG).forEach(([mid, cfg]) => {
@@ -245,6 +276,8 @@ app.get('/api/paper/backtest', async (req: Request, res: Response) => {
     if (!response.ok) throw new Error(`Coinbase ${response.status}`);
     const raw = await response.json() as number[][];
     const candles = raw.sort((a, b) => a[0] - b[0]).filter((row) => Number.isFinite(row[4]) && row[4] > 0);
+    const timeframe = market.endsWith('1h') ? '1h' : '5m';
+    await persistCandles(cfg.product, timeframe, candles);
     const split = Math.max(30, Math.floor(candles.length * 0.8));
     const holdout = candles.slice(split);
     let correct = 0; let brier = 0; let baselineBrier = 0; let trades = 0; let upPredictions = 0;
@@ -263,7 +296,9 @@ app.get('/api/paper/backtest', async (req: Request, res: Response) => {
     const evaluated = Math.max(1, holdout.length - 1);
     const accuracyPct = Math.round((correct / Math.max(1, trades)) * 1000) / 10;
     const brierScore = Math.round((brier / evaluated) * 1000) / 1000;
-    res.json({ market, product: cfg.product, feed: 'Coinbase Exchange candles', generatedAt: Date.now(), candles: candles.length, holdoutCandles: evaluated, horizon: market.endsWith('1h') ? 'next 1h candle' : 'next 5m candle', metrics: { accuracyPct, brierScore, baselineBrier: 0.25, trades, upPredictions }, verdict: accuracyPct >= 52 && brierScore < 0.25 ? 'PASS' : 'HOLD' });
+    const result = { market, product: cfg.product, feed: 'Coinbase Exchange candles', generatedAt: Date.now(), candles: candles.length, holdoutCandles: evaluated, horizon: market.endsWith('1h') ? 'next 1h candle' : 'next 5m candle', metrics: { accuracyPct, brierScore, baselineBrier: 0.25, trades, upPredictions }, verdict: accuracyPct >= 52 && brierScore < 0.25 ? 'PASS' : 'HOLD' };
+    await cacheFeed(`lexi:paper:${market}`, result);
+    res.json({ ...result, persistence: { neon: Boolean(neonPool), redis: Boolean(redis), memory: 'disabled for feed snapshots' } });
   } catch (error) { res.status(503).json({ error: 'Historical market feed unavailable', detail: error instanceof Error ? error.message : 'unknown' }); }
 });
 
