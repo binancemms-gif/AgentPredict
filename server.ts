@@ -104,47 +104,20 @@ async function cacheFeed(key: string, value: unknown) {
   if (redis) await redis.set(key, value, { ex: 120 });
 }
 
-// Initialize state for each market with realistic historical seed data
+// Start empty. Predictions and settled outcomes must come from the live feed and Neon.
 Object.entries(MARKETS_CONFIG).forEach(([mid, cfg]) => {
-  const seedPreds: NMPrediction[] = [];
-  const baseTs = Math.floor(Date.now() / cfg.roundMs) * cfg.roundMs;
-  let settledCount = 38;
-  let wonCount = 23;
-
-  for (let i = settledCount; i >= 1; i--) {
-    const ts = baseTs - i * cfg.roundMs;
-    const isUp = (i * 7 + 3) % 10 > 4;
-    const lean = 0.51 + ((i % 5) - 2) * 0.04;
-    seedPreds.push({
-      made_ts: ts,
-      target_ts: ts + cfg.roundMs,
-      ref_price: mid.startsWith('SOL') ? 172.5 + (i * 0.2) : 67400 + (i * 35),
-      p_up: lean,
-      lean_p: lean,
-      decision: lean >= 0.52 ? 'UP' : lean <= 0.48 ? 'DOWN' : 'NO_TRADE',
-      version: 'nm5-walkforward-v3.1',
-      validated: 1,
-      close_price: mid.startsWith('SOL') ? 172.5 + (i * 0.2) + (isUp ? 0.35 : -0.28) : 67400 + (i * 35) + (isUp ? 80 : -95),
-      outcome: isUp ? 'UP' : 'DOWN',
-      settled: 1,
-    });
-  }
-
   marketEngines[mid] = {
     product: cfg.product,
     roundMs: cfg.roundMs,
     lockBeforeMs: cfg.lockBeforeMs,
     rounds: [],
-    predictions: seedPreds,
-    validatedModel: 'nm5-walkforward-v3.1',
-    leanModel: 'nm5-walkforward-v3.1',
-    weights: [0.012, 0.45, -0.22, 0.31, 0.15, -0.08, 0.28, -0.14],
-    lessons: [
-      `low_vol: 24/40 rounds ended UP (60.0%)`,
-      `order_flow: high taker imbalance correlated with 63.2% directional edge`,
-    ],
+    predictions: [],
+    validatedModel: null,
+    leanModel: 'live-feed-baseline',
+    weights: [],
+    lessons: [],
     paused: false,
-    balance: 1045.5,
+    balance: 0,
   };
 });
 
@@ -184,43 +157,42 @@ async function refreshOraclePredictions() {
   oracleRefreshRunning = true;
   try {
     const now = Date.now();
-    Object.entries(marketEngines).forEach(([mid, engine]) => {
+    await Promise.all(Object.entries(marketEngines).map(async ([mid, engine]) => {
       if (engine.paused) return;
+      const tickerResponse = await fetch(`https://api.exchange.coinbase.com/products/${engine.product}/ticker`);
+      if (!tickerResponse.ok) throw new Error(`Live ticker unavailable for ${engine.product}`);
+      const ticker = await tickerResponse.json() as { price?: string };
+      const livePrice = Number(ticker.price);
+      if (!Number.isFinite(livePrice) || livePrice <= 0) throw new Error(`Invalid live price for ${engine.product}`);
+
       const currentRoundStart = Math.floor(now / engine.roundMs) * engine.roundMs;
       const existing = engine.predictions.find((p) => p.made_ts === currentRoundStart);
-
       if (!existing) {
-        // Calculate dynamic pseudo-signal based on recent minute.
-        const seedVal = Math.sin(now / 100000);
-        const lean = Math.max(0.35, Math.min(0.65, 0.5 + seedVal * 0.12));
-        const pUp = engine.validatedModel ? lean : 0.5;
-        const dec: 'UP' | 'DOWN' | 'NO_TRADE' = pUp >= 0.52 ? 'UP' : pUp <= 0.48 ? 'DOWN' : 'NO_TRADE';
-
+        const lean = 0.5;
         engine.predictions.unshift({
           made_ts: currentRoundStart,
           target_ts: currentRoundStart + engine.roundMs,
-          ref_price: mid.startsWith('SOL') ? 175.0 : 68500.0,
-          p_up: pUp,
+          ref_price: livePrice,
+          p_up: lean,
           lean_p: lean,
-          decision: dec,
-          version: engine.validatedModel || engine.leanModel,
-          validated: engine.validatedModel ? 1 : 0,
+          decision: 'NO_TRADE',
+          version: engine.leanModel,
+          validated: 0,
           close_price: null,
           outcome: null,
           settled: 0,
         });
-
         if (engine.predictions.length > 100) engine.predictions.pop();
       }
 
       engine.predictions.forEach((p) => {
         if (p.settled === 0 && now >= p.target_ts) {
           p.settled = 1;
-          p.close_price = p.ref_price * (1 + (Math.random() - 0.48) * 0.004);
-          p.outcome = p.close_price >= p.ref_price ? 'UP' : 'DOWN';
+          p.close_price = livePrice;
+          p.outcome = livePrice === p.ref_price ? 'TIE' : livePrice > p.ref_price ? 'UP' : 'DOWN';
         }
       });
-    });
+    }));
   } finally {
     oracleRefreshRunning = false;
   }

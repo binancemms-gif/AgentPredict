@@ -40,41 +40,8 @@ export const WinRateTrendChart: React.FC<WinRateTrendChartProps> = ({
   const [viewMode, setViewMode] = useState<'both' | 'user' | 'agent'>('both');
 
   const chartData = useMemo(() => {
-    // If user has few or no rounds recorded, synthesize realistic recent 50 rounds
-    // based on seed data so the user has immediate feedback and can see their live bets integrate.
-    let baseHistory = [...history];
-
-    if (baseHistory.length < 50) {
-      const now = Date.now();
-      const needed = 50 - baseHistory.length;
-      const syntheticRounds: RoundHistoryItem[] = [];
-      const baseAssetPrice = currentPrice || (marketId.startsWith('BTC') ? 68200 : 175);
-      const stepDelta = marketId.startsWith('BTC') ? 45 : 0.4;
-
-      for (let i = needed; i >= 1; i--) {
-        const ts = now - (baseHistory.length + i) * 300_000;
-        const res: 'up' | 'down' = (i * 3 + 7) % 10 > 4 ? 'up' : 'down';
-        // 56% user win rate pattern for realistic seed feedback
-        const userWon = (i * 11 + 2) % 10 < 6;
-        const uPick: 'up' | 'down' = userWon ? res : res === 'up' ? 'down' : 'up';
-        // 58% agent win rate pattern
-        const agentWon = (i * 7 + 4) % 10 < 6;
-        const agPick: 'up' | 'down' = agentWon ? res : res === 'up' ? 'down' : 'up';
-
-        syntheticRounds.push({
-          s: ts,
-          tg: baseAssetPrice + ((i % 10) - 5) * stepDelta,
-          f: baseAssetPrice + ((i % 10) - 5) * stepDelta + (res === 'up' ? stepDelta * 0.8 : -stepDelta * 0.8),
-          res,
-          ag: agPick,
-          ap: 0.54,
-          u: uPick,
-          stake: 10,
-          payout: userWon ? 19 : 0,
-        });
-      }
-      baseHistory = [...baseHistory, ...syntheticRounds];
-    }
+    // Only render rounds that were actually settled by the backend.
+    const baseHistory = [...history];
 
     // Take the last 50 rounds and sort chronologically (oldest to newest)
     const recent50 = baseHistory.slice(0, 50).reverse();
