@@ -657,7 +657,7 @@ export default function App() {
 
     const candleInterval = setInterval(fetchCandles, 60_000);
     const pollInterval = setInterval(pollTicker, 3000);
-    const backendInterval = setInterval(fetchBackendModel, 15_000);
+    const backendInterval = setInterval(fetchBackendModel, 5 * 60_000);
 
     return () => {
       isDisposed = true;

@@ -100,8 +100,13 @@ async function persistCandles(product: string, timeframe: string, candles: numbe
   } finally { client.release(); }
 }
 
-async function cacheFeed(key: string, value: unknown) {
-  if (redis) await redis.set(key, value, { ex: 120 });
+async function cacheFeed(key: string, value: unknown, ttlSeconds = 120) {
+  if (redis) await redis.set(key, value, { ex: ttlSeconds });
+}
+
+async function readCachedFeed<T>(key: string): Promise<T | null> {
+  if (!redis) return null;
+  return (await redis.get<T>(key)) ?? null;
 }
 
 // Start empty. Predictions and settled outcomes must come from the live feed and Neon.
@@ -192,6 +197,15 @@ async function refreshOraclePredictions() {
           p.outcome = livePrice === p.ref_price ? 'TIE' : livePrice > p.ref_price ? 'UP' : 'DOWN';
         }
       });
+
+      await cacheFeed(`lexi:prediction:${mid}`, {
+        market: mid,
+        latest: engine.predictions[0] || null,
+        live_stats: calculateStats(engine.predictions),
+        validated_model: engine.validatedModel,
+        lean_model: engine.leanModel,
+        refreshed_at: now,
+      }, 600);
     }));
   } finally {
     oracleRefreshRunning = false;
@@ -203,21 +217,38 @@ void refreshOraclePredictions();
 setInterval(() => void refreshOraclePredictions(), ORACLE_REFRESH_MS);
 
 // API: /predict or /api/predict endpoint requested by client code
-const handlePredict = (req: Request, res: Response) => {
+const handlePredict = async (req: Request, res: Response) => {
   const market = (req.query.market as string) || 'SOL-5m';
   const engine = marketEngines[market];
   if (!engine) {
     res.status(404).json({ error: 'Market not found' });
     return;
   }
-  const latest = engine.predictions[0] || null;
-  const stats = calculateStats(engine.predictions);
+
+  const cached = await readCachedFeed<{
+    market: string;
+    latest: NMPrediction | null;
+    live_stats: ReturnType<typeof calculateStats>;
+    validated_model: string | null;
+    lean_model: string;
+    refreshed_at: number;
+  }>(`lexi:prediction:${market}`);
+
+  if (cached) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ...cached, source: 'upstash-redis' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
   res.json({
     market,
-    latest,
-    live_stats: stats,
+    latest: engine.predictions[0] || null,
+    live_stats: calculateStats(engine.predictions),
     validated_model: engine.validatedModel,
     lean_model: engine.leanModel,
+    refreshed_at: null,
+    source: 'live-engine',
   });
 };
 
