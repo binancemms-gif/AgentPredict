@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: "Playfair Display", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root {
+  --bg: #000;
+  --card: #0f0f10;
+  --line: #1d1d20;
+  --tx: #f2f2f2;
+  --mut: #8b8b92;
+  --up: #5ee26a;
+  --dn: #ee3344;
+  --gold: #d4af37;
+  color-scheme: dark;
+}
+
+body {
+  background-color: #000;
+  color: #f2f2f2;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Up or Down · BTC & SOL Prediction Oracle",
+  "description": "Live crypto binary prediction oracle with real-time Coinbase feeds, volatility-scaled probability model, order flow analysis, and AI market reads.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
